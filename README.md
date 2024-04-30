@@ -5,7 +5,7 @@ The novel coronavirus disease 2019 (COVID-19) has been widely reported in all ag
 children, adults and elderly populations in the US. However, relatively little attention on COVID-19
 studies were made on understanding the associativity of factors affecting the disease severity among
 children.
-Using the COVID-19 Case Surveillance Public Use Data [4], we assess the factors associated with
+Using the COVID-19 Case Surveillance Public Use Data, we assess the factors associated with
 clinical severity (hospitalization, intensive care unit (ICU) admission, and deaths) among the children
 who contracted COVID-19. Descriptive exploratory analyses were conducted using the subset of the data
 for children and using observations from March 1 to December 16, 2020. Patterns of missing data in the
