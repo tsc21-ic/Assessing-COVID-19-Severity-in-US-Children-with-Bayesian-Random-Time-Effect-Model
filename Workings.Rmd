@@ -1,0 +1,1117 @@
+---
+title: "MATH70076 Data Science coursework 2"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, include=TRUE, eval=TRUE, message=FALSE, warning=FALSE, tidy=TRUE}
+require(data.table)  # data mangling
+require(ggplot2)  # for plotting
+require(scales)  # for scales in plots showing percentages, use 'labs = scales::percent'
+require(rstan)  # run Stan from R
+require(bayesplot)  # plot Stan output
+require(tidyverse)
+require(zoo)
+require(kableExtra)
+```
+
+```{r, eval=FALSE, echo=FALSE}
+data.dir <- "C:\\Users\\Tong\\Documents\\Academic\\Spring term\\Data science\\Coursework"
+out.dir <- data.dir
+
+
+## Load data
+file <- file.path(data.dir,'COVID19.csv')
+data <- fread(file)
+
+## Clean the columns
+dd <- copy(data)
+col_dd <- colnames(dd)
+
+## Date and factor cleaning
+col_dt <- col_dd[1:4]
+dd[, (col_dt) := lapply(.SD, function(x) as.Date(lubridate::fast_strptime(x,"%Y/%m/%d"))), .SDcols = col_dt]
+col_fct <- col_dd[5:length(col_dd)]
+dd[, (col_fct) := lapply(.SD, factor), .SDcols = col_fct]
+
+## Summary of missing values
+missum <- colSums(is.na(dd))
+missum
+
+
+## Investigating this subset of data
+dd_sub <- subset(dd, cdc_case_earliest_dt > "2020-03-01" & (age_group %in% c("0 - 9 Years", "10 - 19 Years")))
+
+
+```
+
+## Clean and check some data
+```{r}
+dd_sub2 <- copy(dd_sub)
+
+set(dd_sub2, i = which(grepl("Alaska", dd_sub2$race_ethnicity_combined)), j = "race_ethnicity_combined","AI/AN")
+set(dd_sub2, i = which(grepl("Asian", dd_sub2$race_ethnicity_combined)), j = "race_ethnicity_combined","Asian")
+set(dd_sub2, i = which(grepl("Black", dd_sub2$race_ethnicity_combined)), j = "race_ethnicity_combined","Black")
+set(dd_sub2, i = which(grepl("Multiple", dd_sub2$race_ethnicity_combined)), j = "race_ethnicity_combined","Multiple/Other")
+set(dd_sub2, i = which(grepl("Hawaiian", dd_sub2$race_ethnicity_combined)), j = "race_ethnicity_combined","Hawaiian/PI")
+set(dd_sub2, i = which(grepl("White", dd_sub2$race_ethnicity_combined)), j = "race_ethnicity_combined","White")
+dd_sub2$race_ethnicity_combined <- droplevels(dd_sub2$race_ethnicity_combined)
+
+## Subset to confirmed cases
+dd_sub2 <- subset(dd_sub2, current_status == "Laboratory-confirmed case")
+
+## Combine age groups 0-19 years old
+set(dd_sub2, i = which(grepl("0 - 9 Years", dd_sub2$age_group)), j = "age_group","0-19")
+set(dd_sub2, i = which(grepl("10 - 19 Years", dd_sub2$age_group)), j = "age_group","0-19")
+dd_sub2$age_group <- droplevels(dd_sub2$age_group)
+
+## Check for number of missing data in all columns
+missum <- colSums(is.na(dd_sub2))
+round(missum/nrow(dd_sub2)*100,2)
+
+prop.table(table(dd_sub2$race_ethnicity_combined))*100
+prop.table(table(dd_sub2$sex))*100
+as.numeric(prop.table(table(dd_sub2$hosp_yn))*100) %>% .[c(2, 4)] %>% sum(.)
+as.numeric(prop.table(table(dd_sub2$icu_yn))*100) %>% .[c(2, 4)] %>% sum(.)
+as.numeric(prop.table(table(dd_sub2$death_yn))*100) %>% .[c(2, 4)] %>% sum(.)
+as.numeric(prop.table(table(dd_sub2$medcond_yn))*100) %>% .[c(2, 4)] %>% sum(.)
+
+## Exclude observations for table summary
+dd_sub3 <- subset(dd_sub2,
+       !(race_ethnicity_combined %in% c('Unknown','Missing')) &
+       !(age_group %in% c('Unknown','Missing', 'Other')) &
+       !(sex %in% c('Unknown','Missing', 'Other'))
+       ) %>% droplevels()
+
+
+saveRDS(dd_sub3, file = file.path(out.dir, paste0('dd_sub3','.rds')))
+
+if (file.exists(file.path(out.dir, paste0('dd_sub3','.rds'))))
+{
+  dd_sub3 <- readRDS( file.path(out.dir, paste0('dd_sub3','.rds')))
+}
+
+```
+
+## Create tables
+```{r}
+## Check for number of missing data in all columns
+missum <- colSums(is.na(dd_sub3))
+# round(missum/nrow(dd_sub2)*100,2)
+
+## Variables to tabularize
+vb <- c("sex", "race_ethnicity_combined")
+## Medical condition (excluding unknown and missing)
+medvb <-  list(c('Yes', 'No'), "Yes", "No")
+
+## Create tables (hospitalization example)
+table_1 <- function(vb, medvb, crit_col){
+  ## For those with hospitalized/ICU/death people
+  crit_hosp <- dd_sub3[dd_sub3[[crit_col]]=="Yes",]
+  medall = list()
+  datalist = list()
+  j=1
+  ## All, Yes and no medical conditions
+  for(medv in medvb){
+    i=1
+    ## For sex and race
+    for(v in vb){
+      ## Among patients with underlying conditions and hospitalized
+      crit_hosp_medcond_y <- subset(crit_hosp, medcond_yn %in% medv)
+      ## Summarize how many in each age group with underlying conditions and hospitalized
+      sex_hosp_med <- crit_hosp_medcond_y[, list(hosp_n = length(get(crit_col))), by = v]
+      ## Obtain those with underlying conditions to calculate the proportions
+      full_ymed <- setnames(data.table(table(subset(dd_sub3, medcond_yn %in% medv)[[v]])), "V1", v)
+      sex_hosp_d <- merge(sex_hosp_med, full_ymed)
+      sex_hosp_d <- sex_hosp_d[, 
+          frac:= paste0(hosp_n, '/', N, " (", round(hosp_n/N*100, 2),"\\%)")][]
+      sex_hosp_d[,c("hosp_n", "N"):=NULL]
+      ## Append this result to datalist
+      datalist[[i]] <- sex_hosp_d
+      i=i+1
+    }
+    medall[[j]] = rbindlist(datalist, use.names=FALSE)
+    j=j+1
+  }
+  return(medall)
+}
+
+
+all_rows <- rbind(data.table(levels(droplevels(dd_sub3$sex))),
+                  data.table(levels(droplevels(dd_sub3$race_ethnicity_combined))))
+setnames(all_rows,"V1", "sex")
+
+df_list <- list(table_1(vb, medvb, "hosp_yn"), table_1(vb, medvb, "icu_yn"), table_1(vb, medvb, "death_yn"))
+```
+
+```{r, warning=FALSE, results='asis'}
+## Combine all results
+severe_type <- c("Hospitalizations", "ICU admissions", "Deaths")
+table_list = list()
+for(i in 1:3){
+  hosp_comb <- Reduce(function(x, y) merge(x,y, by= "sex",all.x=TRUE), df_list[[i]])
+  colnames(hosp_comb)[2:ncol(hosp_comb)] <- paste0('col', 1:(ncol(hosp_comb)-1))
+  hosp_final <- merge(all_rows,hosp_comb, by= "sex",all.x=TRUE, sort=FALSE)
+  table_list[[i]] <- hosp_final
+}
+
+##  Characteristics table
+CharTable <- list()
+i=1
+for(v in vb){
+  xx <- data.table(table(dd_sub3[medcond_yn %in% c("Yes", "No")][[v]]))
+  xx[, total:=sum(N)]
+  xx <- xx[,frac:= round(N/total*100,2)]
+  xx[, final:= paste0(V1, " (", frac,"\\%)")][]
+  xx <- xx[, list(final = final)]
+  CharTable[[i]] = xx
+  i = i + 1
+}
+CharTable <- rbindlist(CharTable)
+
+# Table
+table_final <- Reduce(function(x, y) merge(x,y, by= "sex",all.x=TRUE, sort=FALSE), table_list)
+table_final$sex = CharTable$final
+
+## Header names
+headerNames <- c("")
+for(i in 1:3){
+  names <- setNames(3, sprintf("Reported %s", severe_type[i]))
+  headerNames <- c(headerNames, names)
+}
+table_final[is.na(table_final)] <- "Nil"
+
+kbl(table_final,align = 'c',format="latex", booktabs = T, escape = F, digits = 2, caption = "Reported laboratory-confirmed COVID-19 children patients who were hospitalized, admitted to ICU or death stratified by sex and race and ethnicity based on underlying medical condition indicators.",
+    col.names = c("Characteristics", 
+                  rep(c("Among all patients","Among patients with underlying medical condition",
+                  "Among patients with no underlying medical condition"), 3)))%>%
+    add_header_above(headerNames, bold = T) %>%
+    pack_rows("Sex",1,2) %>%
+    pack_rows("Race and Ethnicity",3,9) %>%
+    column_spec(1, width="11em") %>%
+    column_spec(2:10, width = "5em") %>%
+    row_spec(0, bold=TRUE) %>%
+    collapse_rows(columns = 1, valign = "top") %>%
+    kable_styling(position = "center", latex_options = c("hold_position", "scale_down"), font_size = 12) %>%
+    footnote(general_title = "Abbreviation or meaning:", footnote_as_chunk = TRUE,
+             general = "AI/AN = American Indian/Alaska Native, PI = Pacific Islander, Nil = No reported cases.") %>%
+add_footnote(c("'Unknown', 'Missing' and 'Other' categories for sex, hospitalizations, ICU admissions, and deaths were excluded from the reporting table.",  "Only 'Unknown' and 'Missing' were excluded from race and ethnicity as 'Other' represents more than one race."))
+
+```
+
+## Creating models
+```{r}
+## Reorganize data
+dd <- subset(dd_sub3, select = -c(cdc_report_dt, pos_spec_dt, onset_dt, current_status, age_group))
+setnames(dd,new = c("DATE", "SEX", "RACE", "HOSP", "ICU", "DEATH", "MEDCOND"))
+dd$RACE <- fct_relevel(dd$RACE, c("AI/AN", "Asian", "Black", "Hawaiian/PI", "Hispanic/Latino", "White", "Multiple/Other"))
+
+## Types of severities
+severities = c("HOSP", "ICU", "DEATH")
+
+## Create data for input into Stan
+test <- function(severity, all_var=FALSE, exc_med=FALSE){
+  
+  ## Number of patients by race (for offset in Poisson model)
+  if(all_var){
+    ## Patient numbers
+    rcn <- dd %>% group_by(RACE, SEX, MEDCOND) %>% summarize(source_n = n())
+  }else{
+    rcn <- dd %>% group_by(RACE) %>% summarize(source_n = n())
+  }
+    
+  if(all_var){
+    dd_tmp <- dd
+  }else{
+    ## Exclude sex and medical condition for now
+    dd_tmp <- subset(dd,select = -c(SEX, MEDCOND))
+  }
+    
+  ## Obtain hospitalization records
+  dd_hosp <- dd_tmp[get(severity) == "Yes"]
+  dd_hosp <- subset(dd_hosp,select = !(colnames(dd_hosp) %in% severities[-which(severities==severity)]))
+  
+  if(exc_med){
+  dd_hosp <- dd_hosp[ MEDCOND %in% c("Yes", "No")]
+  }
+  
+  ## Date time
+  dt <- data.table(DATE = dd_hosp[, seq(min(DATE),max(DATE),1)])
+  dt[, WEEK := as.integer(strftime(DATE, format = '%V'))]
+  # week 10 to 51 (42 weeks)
+  dd_hosp <- merge(dd_hosp, dt, by ="DATE")
+  
+  
+  if(all_var){
+    ## hospitalized counts by race, sex, medical condition and week
+    tmp <- dd_hosp[, list(COUNT=length(get(severity))), by=c("RACE", "SEX", "MEDCOND", "WEEK")]
+    }else{
+    ## hospitalization counts by race and week
+    tmp <- dd_hosp[, list(COUNT=length(get(severity))), by=c("RACE", "WEEK")]
+  }
+  
+  ## Create all combinations
+  races <- levels(dd$RACE)
+  weeks <- unique(dt$WEEK)
+  
+  if(all_var){
+    sexes <- levels(dd$SEX)
+    dd_hosp$MEDCOND <- droplevels(dd_hosp$MEDCOND)
+    medconds <- levels(dd_hosp$MEDCOND)
+    allComb <- data.table(expand.grid(races,sexes,medconds, weeks))
+    setnames(allComb,new=c("RACE","SEX", "MEDCOND","WEEK"))
+    tmp2 <- merge(allComb, tmp, by=c("RACE","SEX", "MEDCOND","WEEK"), all.x=TRUE)
+  }else{
+    allComb <- data.table(expand.grid(races, weeks)) ## 7 races 42weeks*7races = 294 rows
+    setnames(allComb,new=c("RACE", "WEEK"))
+    tmp2 <- merge(allComb, tmp, by=c("RACE", "WEEK"), all.x=TRUE)
+  }
+  
+  ## Full set of hospitalization counts in all races and weeks
+  dd_hosp <- set(tmp2, tmp2[,which(is.na(COUNT))], 'COUNT', 0L)
+
+  ## Setup id
+  dd_hosp[, id:= 1:nrow(dd_hosp)]
+
+  ## Design matrix for indicators in races
+  
+  ## Add index variables for races
+  rcs<-as.data.table(races)
+  tmp2 <- dcast.data.table(dd_hosp[,c("RACE", "id")], id ~ factor(RACE, levels=levels(dd$RACE)), value.var = 'id')
+  for (x in 2:ncol(tmp2))
+  {
+    set(tmp2, which(!is.na(tmp2[[x]])), x, 1L)
+    set(tmp2, which(is.na(tmp2[[x]])), x, 0L)
+  }
+  ## Set "White" as baseline
+  tmp2 <- unname(as.matrix(subset(tmp2, select = -c(id, White))))
+  
+  if(all_var){
+    
+      ## Add index variables for sexes
+      sxs<-as.data.table(sexes)
+      tmp3 <- dcast.data.table(dd_hosp[,c("SEX", "id")], id ~ SEX, value.var = 'id')
+      for (x in 2:ncol(tmp3))
+      {
+        set(tmp3, which(!is.na(tmp3[[x]])), x, 1L)
+        set(tmp3, which(is.na(tmp3[[x]])), x, 0L)
+      }
+      tmp3 <- unname(as.matrix(subset(tmp3, select = -c(id, Female))))
+      
+      ## Add index variables for underlying
+      mdcnds<-as.data.table(medconds)
+      tmp4 <- dcast.data.table(dd_hosp[,c("MEDCOND", "id")], id ~ MEDCOND, value.var = 'id')
+      for (x in 2:ncol(tmp4))
+      {
+        set(tmp4, which(!is.na(tmp4[[x]])), x, 1L)
+        set(tmp4, which(is.na(tmp4[[x]])), x, 0L)
+      }
+      
+      tmp4 <- unname(as.matrix(subset(tmp4, select = -c(id, No))))
+      ## White, Female, No underlying as baseline
+        
+      ## Design matrix X
+      X <- cbind(tmp2, tmp3, tmp4)
+      
+      dd_hosp <- merge(dd_hosp, rcn, by=c("RACE", "SEX", "MEDCOND"))
+      
+      ################################################################################
+      ## Cumulative weekly hospitalizations by race
+      dd_hosp[, cumulative_count:= cumsum(COUNT), by="RACE"]
+      
+      ## Adjusted hospitalizations by race proportions per 100,000 people
+      dd_hosp[, STD_CUM_COUNT:= cumulative_count/source_n*1e5]
+    
+      dd_hosp[, name_lab:=if_else(WEEK == 51, RACE, NULL)]
+  }else{
+    
+    dd_hosp <- merge(dd_hosp, rcn, by="RACE")
+    # dd_hosp[, total:= sum(rcn$source_n)]
+    
+    ## Cumulative weekly hospitalizations by race
+    dd_hosp[, cumulative_count:= cumsum(COUNT), by="RACE"]
+    
+    ## Adjusted hospitalizations by race proportions per 100,000 people
+    dd_hosp[, STD_CUM_COUNT:= cumulative_count/source_n*1e5]
+  
+    dd_hosp[, name_lab:=if_else(WEEK == 51, RACE, NULL)]
+  }
+  
+  
+    # specify Stan data
+    stan_data_hosp <- list()
+    stan_data_hosp$N <- nrow(dd_hosp)
+    if(all_var){
+      stan_data_hosp$K <- ncol(X)
+      stan_data_hosp$X <- X
+    }else{
+      stan_data_hosp$K <- ncol(tmp2)
+      stan_data_hosp$X <- tmp2
+    }
+    stan_data_hosp$y <- dd_hosp$COUNT
+    stan_data_hosp$offset <- log(dd_hosp$source_n)
+    
+
+  return(list(dd=dd_hosp[], stan_data=stan_data_hosp))
+}
+```
+
+## Bayesian Model
+```{r}
+poi_regression_txt <- "
+data{
+    int<lower=1> N;
+    int<lower=0> y[N];
+    int<lower=1> K;
+    matrix[N,K] X; // 294*48
+    vector[N] offset;
+}
+parameters{
+    real beta0;
+    vector[K] beta;
+    vector[N] beta_time;
+    real<lower=0> TIME_HYPER_SD;
+}
+transformed parameters{
+    vector[N] log_lambda;
+    log_lambda = beta0 + beta_time + X * beta  + offset;
+}
+model{
+  beta0 ~ normal( 0 , 10 );
+  beta ~ normal( 0 , 1 );
+  TIME_HYPER_SD ~ cauchy(0,1);
+  beta_time ~ normal(0, TIME_HYPER_SD);
+  y ~ poisson_log( log_lambda );
+}
+"
+```
+
+## Run Stan function
+```{r}
+# run Stan
+RunStan <- function(name, name2, stan_data){
+    if (!file.exists(file.path(out.dir, 
+                               paste0(name,name2,'.rds'))))
+    {
+      set.seed(02085533)
+      poi_regression_compiled <- rstan::stan_model(
+        model_name = 'poi_regression', 
+        model_code = gsub('\t',' ',poi_regression_txt)
+      )
+      # hosp_beta0 <- mean(subset(dd_hosp, RACE=="White")[, log(HOSP_COUNT/POP_2020)])
+      hosp_fit <- rstan::sampling(poi_regression_compiled, 
+                    data = stan_data, 
+                    warmup = 5e2, iter = 10e3, chains = 2)
+      saveRDS(hosp_fit, file = file.path(out.dir, 
+                                           paste0(name,name2,'.rds')))
+    }
+    if (file.exists(file.path(out.dir, paste0(name,name2,'.rds'))))
+    {
+      hosp_fit <- readRDS(file.path(out.dir, paste0(name,name2,'.rds')))
+    }
+  return(stanfit=hosp_fit)
+}
+```
+
+## Function for looking at diagnostics
+```{r}
+Diagnostics <- function(fit){
+  ## Get the summary
+  hosp_sum<- summary(fit)$summary
+  hosp_sum <- as.data.frame(hosp_sum)
+  ## Extract the model parameters (beta)
+  hosp_sum <- hosp_sum[grepl("beta",rownames(hosp_sum)), ]
+  ## Check the overall summary for neff and rhat
+  n_eff_sum <- summary(hosp_sum$n_eff)
+  rhat_sum <- summary(hosp_sum$Rhat)
+  ## model parameter with smallest effective sample size
+  hosp_min_n_eff <- hosp_sum[which.min(hosp_sum$n_eff),]
+  min_n_eff <- rownames(hosp_min_n_eff)
+  ## model parameter with largest rhat
+  hosp_max_rhat <- hosp_sum[which.max(hosp_sum$Rhat),]
+  max_rhat <- rownames(hosp_max_rhat)
+  return(list(n_eff_sum=n_eff_sum, rhat_sum=rhat_sum, min_n_eff=min_n_eff,max_rhat=max_rhat))
+}
+```
+
+## Trace plots for smallest n_eff
+```{r}
+min_n_eff_p <- function(fit, min_n_eff){
+  # Extract the MC samples
+  po <- rstan:::extract(fit, inc_warmup = TRUE, permuted = FALSE)
+  # Trace plot of smallest effective sample size : beta0
+  bayesplot:::color_scheme_set("mix-blue-pink")
+  p <- bayesplot:::mcmc_trace(po, pars = min_n_eff, n_warmup = 5e2,
+                              facet_args = list(ncol = 1, labeller = label_parsed))
+  return(p)
+}
+```
+
+## Posterior estimates
+```{r}
+post_p <- function(fit, dd, severity, all_var=FALSE){
+  # Extract COMBINED chains of each parameters
+  # Discard warmup when extracting samples
+  po_HOSP <- rstan::extract(fit, inc_warmup = FALSE)
+  
+  # Transformed posterior estimates of the weekly hospitalizations per 100,000 population
+  po_lambda_new <- exp(po_HOSP$log_lambda)
+  # Summarize the information
+  tmp <- melt(data.table(po_lambda_new), value.name = 'value') %>%
+              group_by(variable) %>%
+              summarise(med = quantile(value, probs = 0.50),
+              lower_95 = quantile(value, probs = 0.025),
+              upper_95 = quantile(value, probs = 0.975))
+  
+  dd_hosp_out <- cbind(dd, tmp[-1])
+  cols <-c("med","lower_95", "upper_95")
+  cols2 <-c("cumsum_med","cumsum_lower_95", "cumsum_upper_95")
+
+  if(all_var){
+    ## By race and sex
+    tmp <- data.table(dd_hosp_out %>% group_by(RACE, SEX, WEEK) %>% 
+      summarize(med = sum(med), lower_95 = sum(lower_95),upper_95 = sum(upper_95)) %>% 
+      mutate(cumsum_med= cumsum(med), cumsum_lower_95= cumsum(lower_95), cumsum_upper_95= cumsum(upper_95)))
+    
+    rcn_po <- dd_hosp_out %>% group_by(RACE, SEX) %>% summarize(source_n=sum(source_n))
+    
+    dd_hosp_out <- merge(tmp, rcn_po)
+    dd_hosp_out[, (cols2) := lapply(.SD, function(x) x/source_n*1e5), .SDcols = cols2]
+    dd_hosp_out[, name_lab:=if_else(WEEK == 51, RACE, NULL)]
+    
+    
+  }else{
+    dd_hosp_out[, (cols2) := lapply(.SD, function(x) cumsum(x)), .SDcols = cols, by=c("RACE")]
+    dd_hosp_out[, (cols2) := lapply(.SD, function(x) x/dd$source_n*1e5), .SDcols = cols2]
+  }
+  
+  dd_hosp_out[, SEVERITY:= severity]
+  dd_hosp_out[, SEVERITY := factor(SEVERITY, levels=c("Hospitalization", "ICU admission", "Death"))]
+  
+  if(all_var){
+  p <- ggplot(dd_hosp_out, aes(x = WEEK, y = cumsum_med, colour=RACE))+
+    geom_line(size = 1)+
+    # geom_point(aes(y = STD_CUM_COUNT),color="red",size = 1)+
+    theme_bw()+
+    # geom_ribbon(mapping = aes(ymin = lower_95, ymax = upper_95, fill = RACE, alpha=0.01
+                              # ))+
+    facet_wrap(.~SEX, nrow=1)+
+    # theme_minimal()+
+    labs(x = "Week number in 2020", y = "Cases per 100,000 COVID-19 patients by race")+
+    ggrepel::geom_text_repel(aes(label=name_lab), hjust = -2,
+    direction = "y",
+    segment.size = .7,
+      segment.alpha = .5,
+      segment.linetype = "dotted",
+      box.padding = .4,
+      segment.curvature = -0.1,
+      segment.ncp = 3,
+      segment.angle = 20) +
+    theme(legend.position = "none")+
+    scale_x_continuous(limits = c(10, 75), breaks=seq(10, 50, 10))
+  }else{
+  ## Plot the Adjusted counts
+  p <- ggplot(dd_hosp_out, aes(x = WEEK, y = cumsum_med, colour=RACE))+
+    geom_line(size = 1)+
+    # geom_point(aes(y = STD_CUM_COUNT),color="red",size = 1)+
+    theme_bw()+
+    labs(x = "Week number in 2020", y = "Cases per 100,000 COVID-19 patients by race")+
+    ggrepel::geom_text_repel(aes(label=name_lab), hjust = -2,
+    direction = "y",
+    segment.size = .7,
+      segment.alpha = .5,
+      segment.linetype = "dotted",
+      box.padding = .4,
+      segment.curvature = -0.1,
+      segment.ncp = 3,
+      segment.angle = 20) +
+    theme(legend.position = "none")+
+    scale_x_continuous(limits = c(10, 60), breaks=seq(10, 50, 10))
+  }
+  return(list(dd_out=dd_hosp_out[], plot=p, po=po_HOSP))
+}
+```
+
+## Rate ratios function
+```{r}
+## Do for race, sex and gender
+rcs_without_baseline <- levels(dd$RACE)[!levels(dd$RACE) %in% "White"]
+sxs_without_baseline <- levels(dd$SEX)[!levels(dd$SEX) %in% "Female"]
+
+ci <- function(po, severityfull, all_var=FALSE){
+  ci_HOSP <- melt(data.table(po$beta), value.name = 'value')%>%
+                  group_by(variable) %>%
+                  summarise(med = quantile(exp(value), probs = 0.50),
+                  lower_95 = quantile(exp(value), probs = 0.025),
+                  upper_95 = quantile(exp(value), probs = 0.975))
+  if(all_var){
+    ci_HOSP$variable <- c(rcs_without_baseline,sxs_without_baseline,medcond_without_baseline)
+    ci_HOSP$variable <- factor(ci_HOSP$variable, levels = ci_HOSP$variable)
+  }else{
+    ci_HOSP$variable <- rcs_without_baseline
+  }
+  
+  ci_HOSP <- ci_HOSP %>% mutate(SEVERITY:=severityfull)
+  
+  return(ci_HOSP)
+}
+```
+
+
+########################## Race only model run #############################################
+
+### HOSP
+```{r}
+## NB: file size can be very large (max RAM utilized)
+memory.limit(size = 1000000)
+
+gc()
+
+## Run for hospitalization using all functions created
+HOSP <- test("HOSP")
+dd_HOSP <- HOSP$dd
+HOSP_fit <- RunStan(name = 'poi_HOSP_fit_',name2 = 'ethnicity', stan_data = HOSP$stan_data)
+HOSP_fit_diagnostics <- Diagnostics(HOSP_fit)
+HOSP_fit_tp <- min_n_eff_p(HOSP_fit, HOSP_fit_diagnostics$min_n_eff)
+pos_HOSP <- post_p(fit = HOSP_fit, dd=dd_HOSP, severity = "Hospitalization")
+
+gc()
+
+## Save data locally to prevent unlikely termination in R
+saveRDS(dd_HOSP, file = file.path(out.dir,paste0('dd_HOSP','.rds')))
+saveRDS(HOSP_fit, file = file.path(out.dir,paste0('hosp_fit','.rds')))
+saveRDS(HOSP_fit_diagnostics, file = file.path(out.dir,paste0('HOSP_fit_diagnostics','.rds')))
+saveRDS(HOSP_fit_tp, file = file.path(out.dir,paste0('HOSP_fit_tp','.rds')))
+saveRDS(pos_HOSP, file = file.path(out.dir,paste0('pos_HOSP','.rds')))
+
+
+## Read files
+dd_HOSP <- readRDS(file.path(out.dir, paste0('dd_HOSP','.rds')))
+HOSP_fit <-  readRDS(file.path(out.dir, paste0('HOSP_fit','.rds')))
+HOSP_fit_diagnostics <-  readRDS(file.path(out.dir, paste0('HOSP_fit_diagnostics','.rds')))
+HOSP_fit_tp <- readRDS(file.path(out.dir, paste0('HOSP_fit_tp','.rds')))
+pos_HOSP <- readRDS(file.path(out.dir, paste0('pos_HOSP','.rds')))
+
+gc()
+
+# HOSP_p <- pos_HOSP$plot
+# po_HOSP <- pos_HOSP$po
+
+
+```
+
+#### ICU
+
+```{r}
+## Run all functions
+ICU <- test("ICU")
+dd_ICU <- ICU$dd
+ICU_fit <- RunStan(name = 'poi_ICU_fit_',name2 = 'ethnicity', stan_data = ICU$stan_data)
+ICU_fit_diagnostics <- Diagnostics(ICU_fit)
+ICU_fit_tp <- min_n_eff_p(ICU_fit, ICU_fit_diagnostics$min_n_eff)
+pos_ICU <- post_p(fit = ICU_fit, dd=dd_ICU, severity = "ICU admission")
+
+## Save data locally to prevent unlikely termination in R
+saveRDS(dd_ICU, file = file.path(out.dir,paste0('dd_ICU','.rds')))
+saveRDS(ICU_fit, file = file.path(out.dir,paste0('ICU_fit','.rds')))
+saveRDS(ICU_fit_diagnostics, file = file.path(out.dir,paste0('ICU_fit_diagnostics','.rds')))
+saveRDS(ICU_fit_tp, file = file.path(out.dir,paste0('ICU_fit_tp','.rds')))
+saveRDS(pos_ICU, file = file.path(out.dir,paste0('pos_ICU','.rds')))
+
+
+gc()
+
+## Read files
+dd_ICU <- readRDS(file.path(out.dir, paste0('dd_ICU','.rds')))
+ICU_fit <-  readRDS(file.path(out.dir, paste0('ICU_fit','.rds')))
+ICU_fit_diagnostics <-  readRDS(file.path(out.dir, paste0('ICU_fit_diagnostics','.rds')))
+ICU_fit_tp <- readRDS(file.path(out.dir, paste0('ICU_fit_tp','.rds')))
+pos_ICU <- readRDS(file.path(out.dir, paste0('pos_ICU','.rds')))
+
+
+gc()
+
+# ICU_p <- pos_ICU$plot
+# po_ICU <- pos_ICU$po
+
+
+```
+
+
+#### DEATH
+
+```{r}
+
+DEATH <- test("DEATH")
+dd_DEATH <- DEATH$dd
+DEATH_fit <- RunStan(name = 'poi_DEATH_fit_',name2 = 'ethnicity', stan_data = DEATH$stan_data)
+DEATH_fit_diagnostics <- Diagnostics(DEATH_fit)
+DEATH_fit_tp <- min_n_eff_p(DEATH_fit, DEATH_fit_diagnostics$min_n_eff)
+pos_DEATH <- post_p(fit = DEATH_fit, dd=dd_DEATH, severity = "Death")
+
+gc()
+
+saveRDS(dd_DEATH, file = file.path(out.dir,paste0('dd_DEATH','.rds')))
+saveRDS(DEATH_fit, file = file.path(out.dir,paste0('DEATH_fit','.rds')))
+saveRDS(DEATH_fit_diagnostics, file = file.path(out.dir,paste0('DEATH_fit_diagnostics','.rds')))
+saveRDS(DEATH_fit_tp, file = file.path(out.dir,paste0('DEATH_fit_tp','.rds')))
+saveRDS(pos_DEATH, file = file.path(out.dir,paste0('pos_DEATH','.rds')))
+
+
+gc()
+
+dd_DEATH <- readRDS(file.path(out.dir, paste0('dd_DEATH','.rds')))
+DEATH_fit <-  readRDS(file.path(out.dir, paste0('DEATH_fit','.rds')))
+DEATH_fit_diagnostics <-  readRDS(file.path(out.dir, paste0('DEATH_fit_diagnostics','.rds')))
+DEATH_fit_tp <- readRDS(file.path(out.dir, paste0('DEATH_fit_tp','.rds')))
+pos_DEATH <- readRDS(file.path(out.dir, paste0('pos_DEATH','.rds')))
+
+
+# DEATH_p <- pos_DEATH$plot
+# po_DEATH <- pos_DEATH$po
+
+
+```
+
+## Save trace plots
+```{r}
+## Save all 3 trace plots for appendix
+all_tp <- list(HOSP_fit_tp, ICU_fit_tp, DEATH_fit_tp)
+tp <- ggpubr::ggarrange(plotlist = all_tp, ncol=1)
+ggsave(tp, filename = "tp_race.png", width = 13, height=7)
+```
+
+
+## Plot all 3 together cumulative sum posterior medians
+```{r}
+pos_all <- rbind(pos_HOSP$dd_out,pos_ICU$dd_out,pos_DEATH$dd_out)
+saveRDS(pos_all, file = file.path(out.dir,paste0('pos_all','.rds')))
+
+p <- ggplot(pos_all, aes(x = WEEK, y = cumsum_med, colour=RACE))+
+    geom_line(size = 1)+
+    # geom_point(aes(y = STD_CUM_COUNT),color="red",size = 1)+
+    theme_bw()+
+    facet_wrap(.~SEVERITY, scales ='free_y', nrow = 1)+
+    labs(x = "\nWeek number in 2020", y = "Cumulative adjusted cases per 100,000 cases by race\n")+
+    ggrepel::geom_text_repel(aes(label=name_lab), hjust = -2, size=4,
+    direction = "y",
+    segment.size = .7,
+      segment.alpha = .5,
+      segment.linetype = "dotted",
+      box.padding = .4,
+      segment.curvature = -0.1,
+      segment.ncp = 3,
+      segment.angle = 20)+
+    theme(legend.position = "none", axis.title = element_text(size=18, face="bold"), strip.text.x = element_text(size = 16, face="bold"),
+          axis.text.x = element_text(size = 14, face="bold"), axis.text.y = element_text(size = 14, face="bold"))+
+    scale_x_continuous(limits = c(10, 75), breaks=seq(10, 50, 10))
+p
+ggsave(filename = "p.png", plot=p, width = 14, height=8, path = out.dir)
+```
+
+##### Rate ratio plots
+```{r}
+## CI
+ci_HOSP <- ci(po = pos_HOSP$po, severityfull ="Hospitalization")
+ci_ICU <- ci(po = pos_ICU$po, "ICU admission")
+ci_death <- ci(po = pos_DEATH$po, "Death")
+
+ratio_p <- rbind(ci_HOSP, ci_ICU, ci_death)
+ratio_p <- ratio_p %>% mutate(SEVERITY = factor(SEVERITY, levels=c("Hospitalization", "ICU admission", "Death")))
+
+saveRDS(ratio_p, file = file.path(out.dir,paste0('ratio_p','.rds')))
+appender <- function(string) paste0(string)
+
+p2 <- ggplot(ratio_p, aes(x= variable, y=med)) +
+  geom_hline(yintercept=1, colour='grey50', linetype='dotted') +
+  geom_point()+
+  geom_pointrange(aes(ymin=lower_95, ymax=upper_95)) +
+  scale_x_discrete(limits=rev)+
+  facet_grid(.~SEVERITY, scales = "free_x", switch = 'x', labeller = as_labeller(appender))+
+  theme_classic(base_size = 16) +
+  theme_bw()+
+  # axis.title = element_text(size=16, face="bold"), axis.text.y = element_text(size=14, face="bold")
+  theme(axis.title.x = element_blank(), strip.placement = "outside", strip.background = element_blank(),
+        panel.grid.major.y = element_blank(),panel.grid.minor.y = element_blank(), axis.text.y = element_text(size = 16,face="bold"),
+        strip.text.x = element_text(size = 18,face="bold"),
+        legend.position = "none", axis.title =element_text(size=18, face="bold"), axis.text.x = element_text(size = 16,face="bold"))+
+  scale_y_continuous(breaks= scales::pretty_breaks(n = 4)) +
+  labs(y='Death rate ratio',x='Races') +
+  coord_flip()
+p2
+ggsave(filename = "p2.png", plot=p2, width = 14, height=6, path = out.dir)
+```
+
+
+## Free some data to preserve RAM
+```{r}
+## Free some data after inspection
+rm(HOSP_fit_tp)
+rm(pos_DEATH)
+rm(pos_ICU)
+rm(pos_HOSP)
+rm(ICU_fit)
+rm(ICU_fit_tp)
+rm(DEATH_fit)
+rm(DEATH_fit_tp)
+```
+
+
+
+####################### ALL (excluding medical conditions (missing, unknown)) ########################################################
+
+## HOSP
+```{r}
+memory.limit(size = 1000000)
+
+gc()
+
+## Run for all severity
+all_HOSP_exc <- test(severity = "HOSP", all_var=TRUE, exc_med = TRUE)
+dd_all_HOSP_exc <- all_HOSP_exc$dd
+all_HOSP_exc_fit <- RunStan(name = 'poi_HOSP_fit_',name2 = 'all', stan_data = all_HOSP_exc$stan_data)
+all_HOSP_fit_diagnostics <- Diagnostics(all_HOSP_exc_fit)
+all_HOSP_fit_tp <- min_n_eff_p(all_HOSP_fit, all_HOSP_fit_diagnostics$min_n_eff)
+pos_all_HOSP_exc <- post_p(fit = all_HOSP_exc_fit, dd=dd_all_HOSP_exc, severity = "Hospitalization", all_var = TRUE)
+
+saveRDS(dd_all_HOSP_exc, file = file.path(out.dir,paste0('dd_all_HOSP_exc','.rds')))
+saveRDS(all_HOSP_exc_fit, file = file.path(out.dir,paste0('all_HOSP_exc_fit','.rds')))
+saveRDS(all_HOSP_exc_fit_diagnostics, file = file.path(out.dir,paste0('all_HOSP_exc_fit_diagnostics','.rds')))
+saveRDS(all_HOSP_exc_fit_tp, file = file.path(out.dir,paste0('all_HOSP_exc_fit_tp','.rds')))
+saveRDS(pos_all_HOSP_exc, file = file.path(out.dir,paste0('pos_all_HOSP_exc','.rds')))
+
+
+dd_all_HOSP_exc <- readRDS(file.path(out.dir, paste0('dd_all_HOSP_exc','.rds')))
+all_HOSP_exc_fit <- readRDS(file.path(out.dir, paste0('all_HOSP_exc_fit','.rds')))
+all_HOSP_exc_fit_diagnostics <- readRDS(file.path(out.dir, paste0('all_HOSP_exc_fit_diagnostics','.rds')))
+all_HOSP_exc_fit_tp <- readRDS(file.path(out.dir, paste0('all_HOSP_exc_fit_tp','.rds')))
+pos_all_HOSP_exc <- readRDS(file.path(out.dir, paste0('pos_all_HOSP_exc','.rds')))
+
+
+# all_HOSP_p <- pos_all_HOSP$plot
+# po_all_HOSP <- pos_all_HOSP$po
+
+
+gc()
+```
+
+#### ICU
+
+```{r}
+## Run for all severity
+all_ICU_exc <- test(severity = "ICU", all_var=TRUE, exc_med = TRUE)
+dd_all_ICU_exc <- all_ICU_exc$dd
+all_ICU_exc_fit <- RunStan(name = 'poi_ICU_fit_',name2 = 'all', stan_data = all_ICU_exc$stan_data)
+all_ICU_exc_fit_diagnostics <- Diagnostics(all_ICU_exc_fit)
+all_ICU_exc_fit_tp <- min_n_eff_p(all_ICU_exc_fit, all_ICU_exc_fit_diagnostics$min_n_eff)
+pos_all_ICU_exc <- post_p(fit = all_ICU_exc_fit, dd=dd_all_ICU_exc, severity = "ICU admission", all_var = TRUE)
+
+
+saveRDS(dd_all_ICU_exc, file = file.path(out.dir,paste0('dd_all_ICU_exc','.rds')))
+saveRDS(all_ICU_exc_fit, file = file.path(out.dir,paste0('all_ICU_exc_fit','.rds')))
+saveRDS(all_ICU_exc_fit_diagnostics, file = file.path(out.dir,paste0('all_ICU_exc_fit_diagnostics','.rds')))
+saveRDS(all_ICU_exc_fit_tp, file = file.path(out.dir,paste0('all_ICU_exc_fit_tp','.rds')))
+saveRDS(pos_all_ICU_exc, file = file.path(out.dir,paste0('pos_all_ICU_exc','.rds')))
+
+
+dd_all_ICU_exc <- readRDS(file.path(out.dir, paste0('dd_all_ICU_exc','.rds')))
+all_ICU_exc_fit <- readRDS(file.path(out.dir, paste0('all_ICU_exc_fit','.rds')))
+all_ICU_exc_fit_diagnostics <- readRDS(file.path(out.dir, paste0('all_ICU_exc_fit_diagnostics','.rds')))
+all_ICU_exc_fit_tp <- readRDS(file.path(out.dir, paste0('all_ICU_exc_fit_tp','.rds')))
+pos_all_ICU_exc <- readRDS(file.path(out.dir, paste0('pos_all_ICU_exc','.rds')))
+
+
+```
+
+## DEATH
+
+```{r}
+## Run for all severity
+all_DEATH_exc <- test(severity = "DEATH", all_var=TRUE, exc_med = TRUE)
+dd_all_DEATH_exc <- all_DEATH_exc$dd
+all_DEATH_exc_fit <- RunStan(name = 'poi_DEATH_fit_',name2 = 'all', stan_data = all_DEATH_exc$stan_data)
+all_DEATH_exc_fit_diagnostics <- Diagnostics(all_DEATH_exc_fit)
+all_DEATH_exc_fit_tp <- min_n_eff_p(all_DEATH_exc_fit, all_DEATH_exc_fit_diagnostics$min_n_eff)
+pos_all_DEATH_exc <- post_p(fit = all_DEATH_exc_fit, dd=dd_all_DEATH_exc, severity = "DEATH admission", all_var = TRUE)
+
+
+saveRDS(dd_all_DEATH_exc, file = file.path(out.dir,paste0('dd_all_DEATH_exc','.rds')))
+saveRDS(all_DEATH_exc_fit, file = file.path(out.dir,paste0('all_DEATH_exc_fit','.rds')))
+saveRDS(all_DEATH_exc_fit_diagnostics, file = file.path(out.dir,paste0('all_DEATH_exc_fit_diagnostics','.rds')))
+saveRDS(all_DEATH_exc_fit_tp, file = file.path(out.dir,paste0('all_DEATH_exc_fit_tp','.rds')))
+saveRDS(pos_all_DEATH_exc, file = file.path(out.dir,paste0('pos_all_DEATH_exc','.rds')))
+
+
+dd_all_DEATH_exc <- readRDS(file.path(out.dir, paste0('dd_all_DEATH_exc','.rds')))
+all_DEATH_exc_fit <- readRDS(file.path(out.dir, paste0('all_DEATH_exc_fit','.rds')))
+all_DEATH_exc_fit_diagnostics <- readRDS(file.path(out.dir, paste0('all_DEATH_exc_fit_diagnostics','.rds')))
+all_DEATH_exc_fit_tp <- readRDS(file.path(out.dir, paste0('all_DEATH_exc_fit_tp','.rds')))
+pos_all_DEATH_exc <- readRDS(file.path(out.dir, paste0('pos_all_DEATH_exc','.rds')))
+
+```
+
+## Plot all 3 together (optional)
+```{r}
+pos_all_under_exc <- rbind(pos_all_HOSP_exc$dd_out,pos_all_ICU_exc$dd_out,pos_all_DEATH_exc$dd_out)
+p <- ggplot(pos_all_under_exc, aes(x = WEEK, y = cumsum_med, colour=RACE))+
+    geom_line(size = 1)+
+    # geom_point(aes(y = STD_CUM_COUNT),color="red",size = 1)+
+    theme_bw()+
+    facet_wrap(SEX~SEVERITY, scales="free_y", nrow=2)+
+    # facet_wrap(factor(SEVERITY, levels=c("Hospitalization", "ICU admission", "Death"))~factor(SEX, levels=c("Male", "Female")), scales="free_y", nrow=1)+
+    # facet_grid(rows = vars(SEX), cols=vars(SEVERITY), scales ='free_y')+
+    labs(x = "Week number in 2020", y = "Cumulative cases per 100,000 patients by race")+
+    ggrepel::geom_text_repel(aes(label=name_lab), hjust = -2,
+    direction = "y",
+    segment.size = .7,
+      segment.alpha = .5,
+      segment.linetype = "dotted",
+      box.padding = .4,
+      segment.curvature = -0.1,
+      segment.ncp = 3,
+      segment.angle = 20)+
+    theme(legend.position = "none", axis.title= element_text(size=12, face="bold"), strip.text.x = element_text(size = 14))+
+    scale_x_continuous(limits = c(10, 75), breaks=seq(10, 50, 10))
+p
+ggsave(filename = "pall_exc1.png", plot=p, width = 20, path = out.dir)
+```
+
+
+## Rate ratios CI (optional)
+```{r}
+## Do for race, sex and gender
+medcond_without_baseline <- levels(dd_all_DEATH_exc$MEDCOND)[!levels(dd_all_DEATH_exc$MEDCOND) %in% "No"]
+dim(pos_all_HOSP_exc$po$beta)
+ci_all_HOSP_exc <- ci(po = pos_all_HOSP_exc$po, "Hospitalization", all_var=TRUE)
+ci_all_ICU_exc <- ci(po = pos_all_ICU_exc$po, "ICU admission", all_var=TRUE)
+ci_all_death_exc <- ci(po = pos_all_DEATH_exc$po, "Death", all_var=TRUE)
+
+ratio_all_p_exc <- rbind(ci_all_HOSP_exc, ci_all_ICU_exc, ci_all_death_exc)
+
+ratio_all_p_exc <- ratio_all_p_exc %>% mutate(SEVERITY = factor(SEVERITY, levels=c("Hospitalization", "ICU admission", "Death")))
+ratio_all_p_exc <- ratio_all_p_exc %>% mutate(FACTOR =rep(c(rep("Race", length(rcs_without_baseline)), 
+                                   rep("Sex", length(sxs_without_baseline)),
+                                   rep("Underlying",length(medcond_without_baseline))),3))
+ratio_all_p_exc <- ratio_all_p_exc %>% mutate(variable = paste0(FACTOR, ": ", variable))
+
+appender <- function(string) paste0(string)
+
+p <- ggplot(ratio_all_p_exc, aes(x= variable, y=med)) +
+  geom_hline(yintercept=1, colour='grey50', linetype='dotted') +
+  geom_point()+
+  geom_pointrange(aes(ymin=lower_95, ymax=upper_95, colour=FACTOR)) +
+  scale_x_discrete(limits=rev)+
+  facet_grid(.~SEVERITY, scales = "free_x", switch = 'x', labeller = as_labeller(appender))+
+  theme_classic(base_size = 16) +
+  theme_bw()+
+  theme(axis.title.x = element_blank(), strip.placement = "outside", strip.background = element_blank(), panel.grid.major.y = element_blank(),panel.grid.minor.y = element_blank(),
+        legend.position = "none", axis.title =element_text(size=12, face="bold"), strip.text.x = element_text(size = 12,face="bold"))+
+  scale_y_continuous(breaks= scales::pretty_breaks(n = 4)) +
+  labs(y='Death rate ratio',x='') +
+  coord_flip()
+p
+ggsave(filename = "pall_exc2.png", plot=p, width = 20, path = out.dir)
+```
+
+
+
+####################### ALL co-variates ########################################################
+
+## HOSP
+```{r}
+memory.limit(size = 20e8)
+
+gc()
+
+## Run for all cases
+all_HOSP <- test(severity = "HOSP", all_var=TRUE)
+dd_all_HOSP <- all_HOSP$dd
+all_HOSP_fit <- RunStan(name = 'poi_HOSP_fit_',name2 = 'all_under', stan_data = all_HOSP$stan_data)
+all_HOSP_fit_diagnostics <- Diagnostics(all_HOSP_fit)
+all_HOSP_fit_tp <- min_n_eff_p(all_HOSP_fit, all_HOSP_fit_diagnostics$min_n_eff)
+pos_all_HOSP <- post_p(fit = all_HOSP_fit, dd=dd_all_HOSP, severity = "Hospitalization", all_var = TRUE)
+
+
+saveRDS(dd_all_HOSP, file = file.path(out.dir,paste0('dd_all_HOSP','.rds')))
+saveRDS(all_HOSP_fit, file = file.path(out.dir,paste0('all_HOSP_fit','.rds')))
+saveRDS(all_HOSP_fit_diagnostics, file = file.path(out.dir,paste0('all_HOSP_fit_diagnostics','.rds')))
+saveRDS(all_HOSP_fit_tp, file = file.path(out.dir,paste0('all_HOSP_fit_tp','.rds')))
+saveRDS(pos_all_HOSP, file = file.path(out.dir,paste0('pos_all_HOSP','.rds')))
+
+
+
+dd_all_HOSP <- readRDS(file.path(out.dir, paste0('dd_all_HOSP','.rds')))
+all_HOSP_fit <- readRDS(file.path(out.dir, paste0('all_HOSP_fit','.rds')))
+all_HOSP_fit_diagnostics <- readRDS(file.path(out.dir, paste0('all_HOSP_fit_diagnostics','.rds')))
+all_HOSP_fit_tp <- readRDS(file.path(out.dir, paste0('all_HOSP_fit_tp','.rds')))
+pos_all_HOSP <- readRDS(file.path(out.dir, paste0('pos_all_HOSP','.rds')))
+
+
+
+gc()
+
+# 
+# all_HOSP_p <- pos_all_HOSP$plot
+# po_all_HOSP <- pos_all_HOSP$po
+
+```
+
+#### ICU
+```{r}
+
+
+all_ICU <- test(severity = "ICU", all_var=TRUE)
+dd_all_ICU <- all_ICU$dd
+all_ICU_fit <- RunStan(name = 'poi_ICU_fit_',name2 = 'all_under', stan_data = all_ICU$stan_data)
+all_ICU_fit_diagnostics <- Diagnostics(all_ICU_fit)
+all_ICU_fit_tp <- min_n_eff_p(all_ICU_fit, all_ICU_fit_diagnostics$min_n_eff)
+pos_all_ICU <- post_p(fit = all_ICU_fit, dd=dd_all_ICU, severity = "ICU admission", all_var = TRUE)
+
+
+gc()
+
+
+saveRDS(dd_all_ICU, file = file.path(out.dir,paste0('dd_all_ICU','.rds')))
+saveRDS(all_ICU_fit, file = file.path(out.dir,paste0('all_ICU_fit','.rds')))
+saveRDS(all_ICU_fit_diagnostics, file = file.path(out.dir,paste0('all_ICU_fit_diagnostics','.rds')))
+saveRDS(all_ICU_fit_tp, file = file.path(out.dir,paste0('all_ICU_fit_tp','.rds')))
+saveRDS(pos_all_ICU, file = file.path(out.dir,paste0('pos_all_ICU','.rds')))
+
+gc()
+
+
+dd_all_ICU <- readRDS(file.path(out.dir, paste0('dd_all_ICU','.rds')))
+all_ICU_fit <- readRDS(file.path(out.dir, paste0('all_ICU_fit','.rds')))
+all_ICU_fit_diagnostics <- readRDS(file.path(out.dir, paste0('all_ICU_fit_diagnostics','.rds')))
+all_ICU_fit_tp <- readRDS(file.path(out.dir, paste0('all_ICU_fit_tp','.rds')))
+pos_all_ICU <- readRDS(file.path(out.dir, paste0('pos_all_ICU','.rds')))
+
+gc()
+
+# all_ICU_p <- pos_all_ICU$plot
+# po_all_ICU <- pos_all_ICU$po
+
+```
+
+#### DEATH
+
+```{r}
+
+all_DEATH <- test(severity = "DEATH", all_var=TRUE)
+dd_all_DEATH <- all_DEATH$dd
+all_DEATH_fit <- RunStan(name = 'poi_DEATH_fit_',name2 = 'all_under', stan_data = all_DEATH$stan_data)
+all_DEATH_fit_diagnostics <- Diagnostics(all_DEATH_fit)
+all_DEATH_fit_tp <- min_n_eff_p(all_DEATH_fit, all_DEATH_fit_diagnostics$min_n_eff)
+pos_all_DEATH <- post_p(fit = all_DEATH_fit, dd=dd_all_DEATH, severity = "Death", all_var = TRUE)
+
+gc()
+
+saveRDS(dd_all_DEATH, file = file.path(out.dir,paste0('dd_all_DEATH','.rds')))
+saveRDS(all_DEATH_fit, file = file.path(out.dir,paste0('all_DEATH_fit','.rds')))
+saveRDS(all_DEATH_fit_diagnostics, file = file.path(out.dir,paste0('all_DEATH_fit_diagnostics','.rds')))
+saveRDS(all_DEATH_fit_tp, file = file.path(out.dir,paste0('all_DEATH_fit_tp','.rds')))
+saveRDS(pos_all_DEATH, file = file.path(out.dir,paste0('pos_all_DEATH','.rds')))
+
+gc()
+
+dd_all_DEATH <- readRDS(file.path(out.dir, paste0('dd_all_DEATH','.rds')))
+all_DEATH_fit <- readRDS(file.path(out.dir, paste0('all_DEATH_fit','.rds')))
+all_DEATH_fit_diagnostics <- readRDS(file.path(out.dir, paste0('all_DEATH_fit_diagnostics','.rds')))
+all_DEATH_fit_tp <- readRDS(file.path(out.dir, paste0('all_DEATH_fit_tp','.rds')))
+pos_all_DEATH <- readRDS(file.path(out.dir, paste0('pos_all_DEATH','.rds')))
+
+
+
+```
+
+## All variables incidence rate ratios
+
+```{r}
+## Do for race, sex and gender
+medcond_without_baseline <- levels(dd_all_DEATH$MEDCOND)[!levels(dd_all_DEATH$MEDCOND) %in% "No"]
+
+ci_all_HOSP <- ci(po = pos_all_HOSP$po, "Hospitalization", all_var=TRUE)
+ci_all_ICU <- ci(po = pos_all_ICU$po, "ICU admission", all_var=TRUE)
+ci_all_death <- ci(po = pos_all_DEATH$po, "Death", all_var=TRUE)
+ratio_all_p <- rbind(ci_all_HOSP, ci_all_ICU, ci_all_death)
+ratio_all_p <- ratio_all_p %>% mutate(SEVERITY = factor(SEVERITY, levels=c("Hospitalization", "ICU admission", "Death")))
+ratio_all_p <- ratio_all_p %>% mutate(FACTOR =rep(c(rep("Race", length(rcs_without_baseline)), 
+                                   rep("Sex", length(sxs_without_baseline)),
+                                   rep("Underlying",length(medcond_without_baseline))),3))
+ratio_all_p <- ratio_all_p %>% mutate(variable = paste0(FACTOR, ": ", variable))
+
+## Save file for next time loading
+saveRDS(ratio_all_p, file = file.path(out.dir,paste0('ratio_all_p','.rds')))
+
+ratio_all_p <- readRDS(file.path(out.dir, paste0('ratio_all_p','.rds')))
+
+
+appender <- function(string) paste0(string)
+
+p <- ggplot(ratio_all_p, aes(x= variable, y=med)) +
+  geom_hline(yintercept=1, colour='grey50', linetype='dotted') +
+  geom_point()+
+  geom_pointrange(aes(ymin=lower_95, ymax=upper_95, colour=FACTOR)) +
+  scale_x_discrete(limits=rev)+
+  facet_grid(.~SEVERITY, scales = "free_x", switch = 'x', labeller = as_labeller(appender))+
+  theme_classic(base_size = 16) +
+  theme_bw()+
+  theme(axis.title.x = element_blank(), strip.placement = "outside", strip.background = element_blank(), panel.grid.major.y = element_blank(),panel.grid.minor.y = element_blank(),
+        legend.position = "none", axis.title =element_text(size=16, face="bold"), axis.text.x = element_text(size=14, face="bold"),axis.text.y = element_text(size=14, face="bold"),
+          strip.text.x = element_text(size = 16,face="bold"))+
+  scale_y_continuous(breaks= scales::pretty_breaks(n = 4)) +
+  labs(y='Death rate ratio',x='') +
+  coord_flip()
+p
+ggsave(filename = "pall2.png", plot=p,width = 14, height=7, path = out.dir)
+```
+
+
+
+## Compile incidence rate ratio for presentation
+
+```{r}
+ratio_all_p <- readRDS(file.path(out.dir, paste0('ratio_all_p','.rds')))
+# round()
+
+ratio_all_p <- data.table(ratio_all_p %>% mutate(across(2:4, round, 2)))
+
+ratio_all_p[, POSTEST:= paste0(sprintf("%.2f", med), " (", sprintf("%.2f", lower_95), ",", sprintf("%.2f", upper_95), ")")]
+set(ratio_all_p,NULL,c("med", "lower_95", "upper_95"), NULL)
+
+
+
+ratio_all_final <- dcast(ratio_all_p, variable~SEVERITY, value.var='POSTEST')
+
+
+ratio_all_final$variable <- sub(".*? ", "", ratio_all_final$variable)
+
+setnames(ratio_all_final, "variable", "Characteristics")
+
+set(ratio_all_final, i = 1:6, j = "Characteristics", 
+    value = paste(ratio_all_final$Characteristics[1:6], footnote_marker_number(1, format = "latex")))
+set(ratio_all_final, i = 7, j = "Characteristics", 
+    value = paste(ratio_all_final$Characteristics[7], footnote_marker_number(2, format = "latex")))
+set(ratio_all_final, i = 8:10, j = "Characteristics", 
+    value = paste(ratio_all_final$Characteristics[8:10], footnote_marker_number(3, format = "latex")))
+
+
+kbl(ratio_all_final, format = "latex", align = 'c' ,booktabs = T, escape = F, digits = 2, caption = "Estimated incidence rate ratios of laboratory-confirmed COVID-19 children patients in severity levels: Hospitalization, ICU admission and Death since week 10 of 2020 under Model 2.")%>%
+    add_header_above(c("Incidence rate ratio (95% credible interval)"=4), bold = T) %>%
+    pack_rows("Race and Ethnicity",1,6) %>%
+    pack_rows("Sex",7,8) %>%
+    pack_rows("Underlying medical condition indicator",8,10) %>%
+    column_spec(1, width="11em") %>%
+    column_spec(2:4, width = "11em") %>%
+    row_spec(0, bold=TRUE) %>%
+    collapse_rows(columns = 1, valign = "middle") %>%
+    kable_styling(position = "center", latex_options = c("hold_position", "scale_down")) %>%
+    footnote(number = c("The reference group is 'White' patients.", "The reference group is 'Female' patients.", "The reference group is 'No' underlying medical condition."))
+
+```
+
+
