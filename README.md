@@ -25,7 +25,7 @@ likely compared to those without. We also find that gender did not provide a sig
 explaining the severity outcomes.
 
 ## Data
-[COVID-19 data](https://bayesian-covid19-data.s3.eu-north-1.amazonaws.com/COVID19.csv)
+[COVID-19](https://bayesian-covid19-data.s3.eu-north-1.amazonaws.com/COVID19.csv)
 
 COVID-19 Case Surveillance Public Use Data containing individual-level patient records collected by jurisdictions across US states and reported voluntarily to CDC. The available
 dataset contains 12 variables for all COVID-19 cases (n = 13, 415, 836) from January 1 to December 16,
