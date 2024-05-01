@@ -1,5 +1,5 @@
 ---
-title: "MATH70076 Data Science coursework 2"
+title: "Assessing COVID-19 Severity in US Children with Bayesian Random Time Effect Model"
 output: html_document
 ---
 
