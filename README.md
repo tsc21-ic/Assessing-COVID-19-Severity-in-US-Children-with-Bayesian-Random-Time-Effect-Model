@@ -20,6 +20,14 @@ Severity outcomes among children with underlying medical conditions were at leas
 likely compared to those without. We also find that gender did not provide a significant contribution in
 explaining the severity outcomes.
 
+## Data
+[COVID-19 data](https://bayesian-covid19-data.s3.eu-north-1.amazonaws.com/COVID19.csv)
+COVID-19 Case Surveillance Public Use Data containing individual-level patient records collected by jurisdictions across US states and reported voluntarily to CDC. The available
+dataset contains 12 variables for all COVID-19 cases (n = 13, 415, 836) from January 1 to December 16,
+2020. The 12 variables included reported times, demographics, exposure history, disease severity indicators
+and outcomes, and the presence of underlying medical conditions of de-identified patients.
+
 ## Prerequisites
 All codes are implemented using the statistical software `R`, version 4.1.1.
 Additional installation of `R` packages are contained in each `R` files.
+
